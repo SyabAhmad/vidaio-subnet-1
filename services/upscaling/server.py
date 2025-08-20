@@ -1,26 +1,29 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+
 from pathlib import Path
 import subprocess
 import os
-from fastapi.responses import JSONResponse
-import time
-import asyncio
-from vidaio_subnet_core import CONFIG
 import re
-from pydantic import BaseModel
+import aiohttp
+from pathlib import Path
+from fastapi import HTTPException
+from vidaio_subnet_core import CONFIG
 from typing import Optional
 from services.miner_utilities.redis_utils import schedule_file_deletion
 from vidaio_subnet_core.utilities import storage_client, download_video
 from loguru import logger
 import traceback
+import asyncio
+from urllib.parse import quote
 
 app = FastAPI()
 
 class UpscaleRequest(BaseModel):
     payload_url: str
     task_type: str
-    # output_file_upscaled: Optional[str] = None
+    chain_strategy: Optional[str] = None
     
 
 def get_frame_rate(input_file: Path) -> float:
@@ -148,54 +151,134 @@ def upscale_video(payload_video_path: str, task_type: str):
         print(f"Error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
+# New: configurable external upscaler URL (env override)
+EXTERNAL_UPSCALER_URL = os.environ.get("EXTERNAL_UPSCALER_URL", "http://localhost:8006/upscale-only/")
+
+def _scale_from_task(task_type: str) -> int:
+    """
+    Map task_type to numeric scale factor used by app.py.
+    SD24K -> 4 (SD -> 4K)
+    HD24K -> 2 (HD -> 4K)
+    SD2HD -> 2 (SD -> HD)
+    Fallback: try to extract digits, else 2
+    """
+    if not task_type:
+        return 2
+    t = str(task_type).strip().upper()
+    if t == "SD24K":
+        return 4
+    if t == "HD24K":
+        return 2
+    if t == "SD2HD":
+        return 2
+    # try to extract numeric scale (e.g., "4", "4X", "8")
+    m = re.search(r"(\d+)", t)
+    if m:
+        try:
+            val = int(m.group(1))
+            return val if val >= 2 else 2
+        except:
+            pass
+    return 2
+
+async def call_external_upscaler(payload_video_path: str, task_type: str, chain_strategy: Optional[str] = None) -> str:
+    """
+    POST the downloaded file to external upscaler and save returned MP4 locally.
+    Returns path to the upscaled file.
+    """
+    scale = _scale_from_task(task_type)
+    try:
+        async with aiohttp.ClientSession() as session:
+            with open(payload_video_path, "rb") as fh:
+                data = aiohttp.FormData()
+                data.add_field("file", fh, filename=Path(payload_video_path).name, content_type="video/mp4")
+                data.add_field("scale_factor", str(scale))
+                data.add_field("model_type", "general")
+                if chain_strategy:
+                    data.add_field("chain_strategy", chain_strategy)
+
+                async with session.post(EXTERNAL_UPSCALER_URL, data=data, timeout=3600) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        raise HTTPException(status_code=500, detail=f"External upscaler failed: {resp.status} - {text}")
+
+                    content = await resp.read()
+                    out_path = str(Path(payload_video_path).with_name(f"{Path(payload_video_path).stem}_upscaled_external.mp4"))
+                    with open(out_path, "wb") as out_f:
+                        out_f.write(content)
+                    return out_path
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"External upscaler error: {e}")
+
 @app.post("/upscale-video")
 async def video_upscaler(request: UpscaleRequest):
+    """
+    Download payload_url, forward to external upscaler, upload result to storage, schedule deletion.
+    """
     try:
         payload_url = request.payload_url
         task_type = request.task_type
+        chain_strategy = request.chain_strategy
 
-        logger.info("📻 Downloading video....")
+        logger.info(f"📻 Downloading video.... (chain_strategy={chain_strategy})")
         payload_video_path: str = await download_video(payload_url)
-        logger.info(f"Download video finished, Path: {payload_video_path}")
+        logger.info(f"Download finished: {payload_video_path}")
 
-        processed_video_path = upscale_video(payload_video_path, task_type)
-        processed_video_name = Path(processed_video_path).name
+        # Forward to external service (now passing optional chain_strategy)
+        processed_video_path = await call_external_upscaler(payload_video_path, task_type, chain_strategy)
 
-        logger.info(f"Processed video path: {processed_video_path}, video name: {processed_video_name}")
+        # remove original downloaded file
+        try:
+            if os.path.exists(payload_video_path):
+                os.remove(payload_video_path)
+                logger.info(f"Removed original downloaded file: {payload_video_path}")
+        except Exception:
+            logger.warning(f"Could not delete original: {payload_video_path}")
 
-        if processed_video_path is not None:
-            object_name: str = processed_video_name
-            
-            await storage_client.upload_file(object_name, processed_video_path)
-            logger.info("Video uploaded successfully.")
-            
-            # Delete the local file since we've already uploaded it to MinIO
+        if not processed_video_path or not os.path.exists(processed_video_path):
+            logger.error("No processed file returned from external upscaler")
+            return JSONResponse({"uploaded_video_url": None})
+
+        object_name = Path(processed_video_path).name
+        await storage_client.upload_file(object_name, processed_video_path)
+        logger.info("Uploaded processed video to storage")
+
+        # remove local processed file
+        try:
             if os.path.exists(processed_video_path):
                 os.remove(processed_video_path)
-                logger.info(f"{processed_video_path} has been deleted.")
-            else:
-                logger.info(f"{processed_video_path} does not exist.")
-                
-            sharing_link: str | None = await storage_client.get_presigned_url(object_name)
-            if not sharing_link:
-                logger.error("Upload failed")
-                return {"uploaded_video_url": None}
-            
-            # Schedule the file for deletion after 10 minutes (600 seconds)
-            deletion_scheduled = schedule_file_deletion(object_name)
-            if deletion_scheduled:
-                logger.info(f"Scheduled deletion of {object_name} after 10 minutes")
-            else:
-                logger.warning(f"Failed to schedule deletion of {object_name}")
-            
-            logger.info(f"Public download link: {sharing_link}")  
+                logger.info(f"Removed local processed file: {processed_video_path}")
+        except Exception:
+            logger.warning(f"Could not delete processed file: {processed_video_path}")
 
-            return {"uploaded_video_url": sharing_link}
+        try:
+            sharing_link: str | None = await storage_client.get_presigned_url(object_name)
+        except Exception as e:
+            # Fallback: construct direct bucket URL (requires public bucket/policy)
+            logger.exception("Presigned URL generation failed; falling back to direct bucket URL")
+            endpoint = getattr(CONFIG, "storage").endpoint if hasattr(CONFIG, "storage") else os.environ.get("BUCKET_COMPATIBLE_ENDPOINT", "")
+            bucket = getattr(CONFIG, "storage").bucket_name if hasattr(CONFIG, "storage") else os.environ.get("BUCKET_NAME", "")
+            endpoint = endpoint.rstrip("/")
+            if not endpoint or not bucket:
+                logger.error("Cannot construct fallback URL: missing endpoint or bucket name")
+                return JSONResponse({"uploaded_video_url": None})
+            sharing_link = f"{endpoint}/{bucket}/{quote(object_name)}"
+            logger.info(f"Using fallback direct URL: {sharing_link}")
+
+        if not sharing_link:
+            logger.error("Upload failed, no presigned URL or fallback URL")
+            return JSONResponse({"uploaded_video_url": None})
+
+        # schedule deletion
+        schedule_file_deletion(object_name)
+
+        return JSONResponse({"uploaded_video_url": sharing_link})
 
     except Exception as e:
         logger.error(f"Failed to process upscaling request: {e}")
-        traceback.print_exc()
-        return {"uploaded_video_url": None}
+        return JSONResponse({"uploaded_video_url": None})
 
 
 if __name__ == "__main__":
